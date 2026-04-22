@@ -475,6 +475,7 @@ def init_wandb(args, config: TrainConfig, trainable_params: int, total_params: i
         )
 
     return wandb.init(
+        entity="yuzhenzh-carnegie-mellon-university",
         project=args.wandb_project,
         name=run_name,
         mode=args.wandb_mode,
@@ -741,7 +742,7 @@ def build_arg_parser():
 
     parser.add_argument("--wandb", action="store_true", default=True)
     parser.add_argument("--no_wandb", action="store_false", dest="wandb")
-    parser.add_argument("--wandb_project", type=str, default="diffugpt-lora")
+    parser.add_argument("--wandb_project", type=str, default="423-final-proj")
     parser.add_argument("--wandb_mode", choices=["online", "offline", "disabled"], default="online")
     parser.add_argument("--run_name", type=str, default=None)
 
