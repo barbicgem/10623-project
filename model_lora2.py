@@ -1,36 +1,37 @@
 """
 Attention-only LoRA finetuning for DiffuGPT-medium with the DDM-SFT loss.
 
-Examples:
-  python model_lora2.py --dataset samsum --steps 3000 --batch_size 8 --precision fp16
-  python model_lora2.py --dataset gsm8k --steps 6000 --batch_size 8 --precision fp16
-  python model_lora2.py --dataset gsm8k --steps 6000 --batch_size 32 --precision bf16 --rank 16 --lr 1e-4
-  python model_lora2.py --resume_lora output/diffugpt-m-lora/lora_step500.pt --steps 3000
+Quick start:
+  python model_lora2.py --dataset samsum --steps 6000 --batch_size 16 --lr 1e-5 --precision fp16
+  python model_lora2.py --dataset gsm8k --batch_size 8 --precision fp16
 
-Important defaults:
-  - W&B is enabled by default; use --no_wandb to disable or --wandb_mode offline.
-  - --load_mode ddm loads DiffuGPT through DiscreteDiffusionModel.from_pretrained.
-  - LoRA is applied only to GPT attention c_attn/c_proj modules.
-  - embed_tokens is trainable by default; use --no_train_embeddings to freeze it.
+Most common knobs:
+  --dataset {samsum,gsm8k}    task/data to finetune on
+  --rank 8                    LoRA rank
+  --lr 1e-4                   learning rate
+  --batch_size 16             per-step batch size
+  --precision auto            auto, fp16, bf16, or fp32. Use fp16 for V100, bf16 for H100
+  --log_every 10              training log frequency
+  --eval_every 100            cheap denoising-loss eval frequency
+  --metric_every 1000         expensive ROUGE-L/GSM exact-match generation eval frequency
 
-CLI params:
-  Model: --model_name --base_model_name --load_mode {ddm,causal_lm} --resume_lora
-  Data: --dataset {samsum,gsm8k} --train_split --eval_split --max_train_samples --max_eval_samples --num_workers
-  LoRA: --rank --lora_alpha --lora_dropout --target_layers --no_train_embeddings
-  Train: --steps --lr --min_lr_ratio --warmup_steps --weight_decay --batch_size
-         --max_len --min_target_tokens --grad_clip --precision {auto,fp32,fp16,bf16}
-         --sampling_eps --no_shift
-  Logging/checkpoints: --log_every --eval_every --eval_batches --save_every --output_dir --seed
-  W&B: --wandb --no_wandb --wandb_project --wandb_mode {online,offline,disabled} --run_name
+Notes:
+  - W&B is on by default; use --no_wandb to disable.
+  - LoRA is intentionally applied only to GPT attention c_attn/c_proj modules.
+  - Metric eval logs a few prompt/reference/prediction examples to W&B.
+  - Use --help for all advanced options.
 """
 
 import argparse
 import math
 import os
-from contextlib import nullcontext
+import re
+from contextlib import nullcontext, redirect_stdout
 from dataclasses import asdict, dataclass
 from itertools import cycle
+from types import SimpleNamespace
 from typing import Optional
+import io
 
 import torch
 import torch.nn as nn
@@ -404,6 +405,10 @@ class TrainConfig:
     precision: str
     shift: bool
     sampling_eps: float
+    metric_every: int
+    metric_max_examples: int
+    metric_diffusion_steps: int
+    metric_max_new_tokens: int
 
 
 def compute_lr(step: int, total_steps: int, base_lr: float, warmup_steps: int, min_lr_ratio: float):
@@ -470,7 +475,7 @@ def init_wandb(args, config: TrainConfig, trainable_params: int, total_params: i
     run_name = args.run_name
     if run_name is None:
         run_name = (
-            f"diffugpt-m-{args.dataset}-r{args.rank}-"
+            f"{args.dataset}-r{args.rank}-"
             f"lr{args.lr:g}-bs{args.batch_size}"
         )
 
@@ -534,6 +539,151 @@ def eval_loss(
     }
 
 
+def load_metric_examples(dataset_name: str, split: str, max_examples: int):
+    if max_examples <= 0:
+        return []
+
+    ds = load_named_dataset(dataset_name, split)
+    ds = ds.select(range(min(max_examples, len(ds))))
+    examples = []
+    for example in ds:
+        prompt, target = make_prompt_target(example, dataset_name)
+        examples.append({"prompt": prompt, "target": target})
+    return examples
+
+
+def truncate_at_eos(token_ids, tokenizer):
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None or eos_token_id not in token_ids:
+        return token_ids
+    return token_ids[: token_ids.index(eos_token_id)]
+
+
+def generate_target_text(model, tokenizer, args, prompt: str, target: str, device):
+    from model import generate_samples
+
+    target_ids = tokenizer.encode(target, add_special_tokens=False)
+    target_token_count = max(1, min(len(target_ids), args.metric_max_new_tokens, args.max_len))
+    max_prompt_len = max(0, args.max_len - target_token_count)
+    if max_prompt_len > 0:
+        prompt_ids = tokenizer.encode(
+            prompt,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=max_prompt_len,
+        )
+    else:
+        prompt_ids = []
+
+    x0 = prompt_ids + [0] * target_token_count
+    src_mask = [1] * len(prompt_ids) + [0] * target_token_count
+    inputs = {
+        "input_ids": torch.tensor([x0], device=device),
+        "src_mask": torch.tensor([src_mask], device=device),
+    }
+    decode_args = SimpleNamespace(
+        diffusion_steps=args.metric_diffusion_steps,
+        logits_temp=args.metric_logits_temp,
+        topp_temp=args.metric_topp_temp,
+        shift=args.shift,
+    )
+
+    with redirect_stdout(io.StringIO()):
+        result = generate_samples(model, decode_args, tokenizer, inputs, verbose=False)
+    pred_ids = result.tolist()[0][-target_token_count:]
+    pred_ids = truncate_at_eos(pred_ids, tokenizer)
+    return tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
+
+
+def extract_gsm_answer(text: str):
+    after_marker = re.search(r"####\s*([-+]?(?:\d+(?:,\d{3})*|\d+)(?:\.\d+)?)", text)
+    if after_marker:
+        return after_marker.group(1).replace(",", "")
+
+    numbers = re.findall(r"[-+]?(?:\d+(?:,\d{3})*|\d+)(?:\.\d+)?", text)
+    if not numbers:
+        return ""
+    return numbers[-1].replace(",", "")
+
+
+def compute_rouge_l(predictions, references):
+    try:
+        import evaluate
+    except ImportError:
+        print("evaluate is not installed; skipping ROUGE-L metric.")
+        return None
+
+    rouge = evaluate.load("rouge")
+    scores = rouge.compute(predictions=predictions, references=references)
+    return float(scores["rougeL"] * 100)
+
+
+def make_examples_table(wandb_run, rows):
+    if wandb_run is None:
+        return None
+
+    try:
+        import wandb
+    except ImportError:
+        return None
+
+    table = wandb.Table(columns=["index", "prompt", "reference", "prediction"])
+    for row in rows:
+        table.add_data(row["index"], row["prompt"], row["reference"], row["prediction"])
+    return table
+
+
+def eval_generation_metrics(model, tokenizer, args, metric_examples, device, wandb_run=None):
+    if not metric_examples:
+        return {}
+
+    model.eval()
+    predictions = []
+    references = []
+    example_rows = []
+
+    with torch.no_grad():
+        for idx, example in enumerate(metric_examples):
+            prediction = generate_target_text(
+                model,
+                tokenizer,
+                args,
+                prompt=example["prompt"],
+                target=example["target"],
+                device=device,
+            )
+            predictions.append(prediction)
+            references.append(example["target"])
+
+            if idx < args.metric_examples_to_log:
+                example_rows.append(
+                    {
+                        "index": idx,
+                        "prompt": example["prompt"],
+                        "reference": example["target"],
+                        "prediction": prediction,
+                    }
+                )
+
+    metrics = {"metric/examples": len(metric_examples)}
+    if args.dataset == "samsum":
+        rouge_l = compute_rouge_l(predictions, references)
+        if rouge_l is not None:
+            metrics["metric/rougeL"] = rouge_l
+    elif args.dataset == "gsm8k":
+        correct = 0
+        for pred, ref in zip(predictions, references):
+            correct += int(extract_gsm_answer(pred) == extract_gsm_answer(ref))
+        metrics["metric/exact_match"] = 100.0 * correct / max(1, len(references))
+
+    table = make_examples_table(wandb_run, example_rows)
+    if table is not None:
+        metrics[f"examples/{args.dataset}"] = table
+
+    model.train()
+    return metrics
+
+
 def save_checkpoint(model, args, config: TrainConfig, step: int, suffix: str):
     os.makedirs(args.output_dir, exist_ok=True)
     save_path = os.path.join(args.output_dir, f"lora_{suffix}.pt")
@@ -557,6 +707,8 @@ def train(
     model,
     train_loader,
     val_loader,
+    metric_examples,
+    tokenizer,
     mask_token_id,
     device,
     args,
@@ -650,6 +802,19 @@ def train(
             )
             log_metrics(wandb_run, metrics, optimizer_step)
 
+        if metric_examples and args.metric_every > 0 and optimizer_step % args.metric_every == 0:
+            metrics = eval_generation_metrics(
+                model,
+                tokenizer,
+                args,
+                metric_examples=metric_examples,
+                device=device,
+                wandb_run=wandb_run,
+            )
+            printable = {k: v for k, v in metrics.items() if not k.startswith("examples/")}
+            print(f"metric eval step {optimizer_step} | {printable}")
+            log_metrics(wandb_run, metrics, optimizer_step)
+
         if args.save_every > 0 and optimizer_step % args.save_every == 0:
             save_checkpoint(model, args, config, optimizer_step, suffix=f"step{optimizer_step}")
 
@@ -697,7 +862,8 @@ def load_diffugpt(args, tokenizer, config, device):
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Attention-only LoRA finetuning for DiffuGPT-medium with a DDM-SFT loss."
+        description="Attention-only LoRA finetuning for DiffuGPT-medium with a DDM-SFT loss.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument("--model_name", type=str, default="diffusionfamily/diffugpt-m")
@@ -736,6 +902,13 @@ def build_arg_parser():
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--eval_batches", type=int, default=20)
+    parser.add_argument("--metric_every", type=int, default=1000)
+    parser.add_argument("--metric_max_examples", type=int, default=64)
+    parser.add_argument("--metric_examples_to_log", type=int, default=4)
+    parser.add_argument("--metric_diffusion_steps", type=int, default=64)
+    parser.add_argument("--metric_max_new_tokens", type=int, default=64)
+    parser.add_argument("--metric_logits_temp", type=float, default=0.95)
+    parser.add_argument("--metric_topp_temp", type=float, default=0.9)
     parser.add_argument("--save_every", type=int, default=500)
     parser.add_argument("--output_dir", type=str, default="output/diffugpt-m-lora")
     parser.add_argument("--seed", type=int, default=0)
@@ -842,13 +1015,27 @@ def main():
         precision=precision,
         shift=args.shift,
         sampling_eps=args.sampling_eps,
+        metric_every=args.metric_every,
+        metric_max_examples=args.metric_max_examples,
+        metric_diffusion_steps=args.metric_diffusion_steps,
+        metric_max_new_tokens=args.metric_max_new_tokens,
     )
     wandb_run = init_wandb(args, train_config, trainable_params, total_params)
+
+    metric_examples = []
+    if args.metric_every > 0 and args.metric_max_examples > 0:
+        metric_examples = load_metric_examples(
+            args.dataset,
+            split=args.eval_split,
+            max_examples=args.metric_max_examples,
+        )
 
     ddm = train(
         ddm,
         train_loader=train_loader,
         val_loader=val_loader,
+        metric_examples=metric_examples,
+        tokenizer=tokenizer,
         mask_token_id=tokenizer.mask_token_id,
         device=device,
         args=args,
