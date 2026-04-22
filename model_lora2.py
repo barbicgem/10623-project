@@ -2,7 +2,7 @@
 Attention-only LoRA finetuning for DiffuGPT-medium with the DDM-SFT loss.
 
 Quick start:
-  python model_lora2.py --dataset samsum --steps 6000 --batch_size 16 --lr 1e-5 --precision fp16
+  python model_lora2.py --dataset samsum --steps 6000 --batch_size 16 --lr 5e-5 --precision fp16
   python model_lora2.py --dataset gsm8k --batch_size 8 --precision fp16
 
 Most common knobs:
