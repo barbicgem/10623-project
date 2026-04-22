@@ -45,7 +45,7 @@ class DiscreteDiffusionModel(nn.Module, PyTorchModelHubMixin):
             self.embed_tokens = self.model.transformer.wte
             self.denoise_model = self.model.transformer # use inputs_embeds instead of input_ids in forward function
             for gpt2block in self.model.transformer.h:
-                gpt2block.attn.bias.fill_(True)  # remove causal mask
+                gpt2block.attn.bias.fill_(True)  # remove causal mask, which is GPT2's default behavior
             self.lm_head = self.model.lm_head
             del self.denoise_model.wte
         elif getattr(self.config, "model_type", None) == "llama":
@@ -99,7 +99,7 @@ def generate_samples(model, diff_args, tokenizer, inputs, verbose=False):
     batch_size = x.size(0)
     attention_mask = get_anneal_attn_mask(seq_len, batch_size, dtype=x_embed.dtype, device=x.device, attn_mask_ratio=1.0) # all 0
 
-    init_maskable_mask = maskable_mask = ~src_mask
+    init_maskable_mask = maskable_mask = ~src_mask # True for masked tokens that are to be denoised
     
     # first forward, all position except src is [M]
     xt = x.masked_fill(maskable_mask, tokenizer.mask_token_id)
@@ -107,6 +107,7 @@ def generate_samples(model, diff_args, tokenizer, inputs, verbose=False):
     if verbose:
         print(f"t=T(in):", tokenizer.decode(xt.tolist()[0]))
 
+    # Predict a clean-token distribution for every current [MASK] position.
     logits = model(xt, attention_mask=attention_mask)
     filter_logits = top_p_logits(logits/logits_temp, p=topp_temp)
     scores = torch.log_softmax(filter_logits, dim=-1)
@@ -115,27 +116,36 @@ def generate_samples(model, diff_args, tokenizer, inputs, verbose=False):
     x0 = dists.Categorical(logits=scores).sample()
     x0_scores = torch.gather(scores, -1, x0.unsqueeze(-1)).squeeze(-1)
 
-    if diff_args.shift:
-        #### deal with shift, left most token will be replaced anyway
+    if diff_args.shift: # This should be true for finetuning
+        # GPT-style next-token logits predict token i from position i-1, but we want to turn masked tokens into predicted tokens at the same index
+        # so we shift predicted tokens by 1 index to the right
         x0 = torch.cat([x[:,0:1], x0[:, :-1]], dim=1)
         x0_scores = torch.cat([x0_scores[:,0:1], x0_scores[:, :-1]], dim=1)
     
-    #### replace output of non-[MASK] positions with xt
+    # Keep fixed/already-visible tokens unchanged; only masked slots use sampled tokens.
     x0 = xt.masked_scatter(maskable_mask, x0[maskable_mask])
     if verbose:
         print(f"t=T(out):", tokenizer.decode(x0.tolist()[0]))
 
+    ####### Loop simplification:
+    # xt = current partially masked sequence
+    # model(xt) -> predicts x0, a full sequence of word tokens
+    # choose some masked positions to commit (turn into word tokens)
+    # copy those positions from x0 into xt
+    # repeat
+
     for t in range(diff_args.diffusion_steps-1, 0, -1): # t from T-1 to 1
         with torch.no_grad():
-            #### select rate% tokens to be still [MASK]
+            # Commit a random fraction of still-masked positions to their latest predictions.
             p_to_x0 = 1/(t+1)
-            
+            # reduces the number of masked tokens
             masked_to_x0 = maskable_mask & (torch.rand_like(x0, dtype=torch.float) < p_to_x0)
             xt.masked_scatter_(masked_to_x0, x0[masked_to_x0])
             maskable_mask = maskable_mask.masked_fill(masked_to_x0, False)
             if verbose:
                 print(f"t={t}(in):", tokenizer.decode(xt.tolist()[0]))
 
+            # denoise the partially filled sequence
             logits = model(xt, attention_mask=attention_mask)
             filter_logits = top_p_logits(logits/logits_temp, p=topp_temp)
             scores = torch.log_softmax(filter_logits, dim=-1)
@@ -147,12 +157,13 @@ def generate_samples(model, diff_args, tokenizer, inputs, verbose=False):
                 x0 = torch.cat([x[:,0:1], x0[:, :-1]], dim=1)
                 x0_scores = torch.cat([x0_scores[:,0:1], x0_scores[:, :-1]], dim=1)
             
-            # replace output of non-[MASK] positions with xt
+            # Preserve tokens that are not eligible for denoising in future iterations.
             x0 = xt.masked_scatter(maskable_mask, x0[maskable_mask])
             if verbose:
                 print(f"t={t}(out):", tokenizer.decode(x0.tolist()[0]))
             
     if diff_args.shift:
+        # Drop the seed token introduced by shifted next-token prediction.
         x0 = x0[:,1:]
 
     return x0
@@ -173,6 +184,11 @@ class LinearNoise():
         return t
 
 def get_anneal_attn_mask(seq_len, bsz, dtype, device, attn_mask_ratio):
+    # generates an attention mask with (attn_mask_ratio%) random extra future positions
+    # when attn_mask_ratio = 0, returns causal mask. This is only used for pretraining!
+    # when attn_mask_ratio = 1, returns a fully bidirectional mask: all 0's
+    #       - mask is additive so 0 means no effect on visibility. 
+    #       - this is used for finetuning and inference.
     mask = torch.full((seq_len, seq_len), 0, device=device)
     mask_cond = torch.arange(mask.size(-1), device=device)
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 1)
