@@ -222,6 +222,28 @@ def make_prompt_target(example: dict, dataset_name: str):
         return build_gsm8k_prompt(example["question"]), example["answer"]
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
+# def extract_gsm8k_final_answer(answer_text: str) -> str:
+#     answer_text = answer_text.strip()
+#     if "####" in answer_text:
+#         final_answer = answer_text.split("####")[-1].strip()
+#     else:
+#         matches = re.findall(r"-?\d+(?:\.\d+)?", answer_text.replace(",", ""))
+#         final_answer = matches[-1] if matches else answer_text.strip()
+
+#     return final_answer.replace(",", "").rstrip(".")
+
+
+# def make_prompt_target(example: dict, dataset_name: str):
+#     if dataset_name == "samsum":
+#         return build_samsum_prompt(example["dialogue"]), example["summary"]
+
+#     if dataset_name == "gsm8k":
+#         prompt = build_gsm8k_prompt(example["question"])
+#         final_answer = extract_gsm8k_final_answer(example["answer"])
+#         target = final_answer
+#         return prompt, target
+
+    # raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 def encode_prompt_target(
     tokenizer,
