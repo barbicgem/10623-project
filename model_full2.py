@@ -1,13 +1,12 @@
 """
-Attention-only LoRA finetuning for DiffuGPT-medium with the DDM-SFT loss.
+Full finetuning for DiffuGPT-medium with the DDM-SFT loss.
 
 Quick start:
-  python model_lora2.py --dataset samsum --steps 6000 --batch_size 16 --lr 5e-5 --precision fp16
-  python model_lora2.py --dataset gsm8k --batch_size 8 --precision fp16
+  python model_full2.py --dataset samsum --steps 6000 --batch_size 16 --lr 5e-5 --precision fp16
+  python model_full2.py --dataset gsm8k --batch_size 8 --precision fp16
 
 Most common knobs:
   --dataset {samsum,gsm8k}    task/data to finetune on
-  --rank 8                    LoRA rank
   --lr 1e-4                   learning rate
   --batch_size 16             per-step batch size
   --precision auto            auto, fp16, bf16, or fp32. Use fp16 for V100, bf16 for H100
@@ -17,12 +16,13 @@ Most common knobs:
 
 Notes:
   - W&B is on by default; use --no_wandb to disable.
-  - LoRA is intentionally applied only to GPT attention c_attn/c_proj modules.
+  - This script trains all DiffuGPT parameters, not LoRA adapters.
   - Metric eval logs a few prompt/reference/prediction examples to W&B.
   - Use --help for all advanced options.
 """
 
 import argparse
+import io
 import math
 import os
 import re
@@ -30,181 +30,11 @@ from contextlib import nullcontext, redirect_stdout
 from dataclasses import asdict, dataclass
 from itertools import cycle
 from types import SimpleNamespace
-from typing import Optional
-import io
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-
-try:
-    from transformers.pytorch_utils import Conv1D
-except ImportError:
-    Conv1D = None
-
-
-class LoRALayer(nn.Module):
-    def __init__(self, base_layer: nn.Module, r: int, lora_alpha: int, dropout: float = 0.0):
-        super().__init__()
-
-        if r <= 0:
-            raise ValueError(f"LoRA rank must be > 0, got {r}")
-
-        self.base_layer = base_layer
-        self.r = r
-        self.scale = lora_alpha / r
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        if isinstance(base_layer, nn.Linear):
-            in_features = base_layer.in_features
-            out_features = base_layer.out_features
-        elif Conv1D is not None and isinstance(base_layer, Conv1D):
-            in_features, out_features = base_layer.weight.shape
-        else:
-            raise TypeError(f"Unsupported layer type: {type(base_layer)}")
-
-        self.in_features = in_features
-        self.out_features = out_features
-
-        self.lora_A = nn.Parameter(torch.empty(r, in_features))
-        self.lora_B = nn.Parameter(torch.empty(out_features, r))
-
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
-
-        for p in self.base_layer.parameters():
-            p.requires_grad = False
-
-    def forward(self, x):
-        base_out = self.base_layer(x)
-        lora_out = self.dropout(x) @ self.lora_A.T @ self.lora_B.T
-        return base_out + self.scale * lora_out
-
-
-def _get_parent_and_child(model: nn.Module, full_name: str):
-    parts = full_name.split(".")
-    if len(parts) == 1:
-        return model, parts[0]
-    parent_name = ".".join(parts[:-1])
-    child_name = parts[-1]
-    parent = model.get_submodule(parent_name)
-    return parent, child_name
-
-
-def parse_target_layers(raw: Optional[str]):
-    if raw is None or raw.strip() == "":
-        return None
-    return [int(x.strip()) for x in raw.split(",") if x.strip()]
-
-
-def inject_lora_attention_only(
-    model: nn.Module,
-    r: int,
-    lora_alpha: int,
-    dropout: float = 0.0,
-    target_layers=None,
-    verbose: bool = True,
-):
-    """
-    Targets only GPT-style attention projections:
-      - *.attn.c_attn
-      - *.attn.c_proj
-
-    This avoids accidentally hitting mlp.c_proj.
-    """
-    if target_layers is not None:
-        target_layers = set(target_layers)
-
-    replaced = []
-
-    for name, module in list(model.named_modules()):
-        leaf = name.split(".")[-1]
-        parts = name.split(".")
-        numeric_parts = [int(p) for p in parts if p.isdigit()]
-        block_idx = numeric_parts[0] if numeric_parts else None
-
-        linear_types = (nn.Linear,) if Conv1D is None else (nn.Linear, Conv1D)
-        is_target = (
-            ("attn" in parts)
-            and (leaf in {"c_attn", "c_proj"})
-            and isinstance(module, linear_types)
-            and (target_layers is None or block_idx in target_layers)
-        )
-
-        if not is_target:
-            continue
-
-        parent, child = _get_parent_and_child(model, name)
-        setattr(parent, child, LoRALayer(module, r=r, lora_alpha=lora_alpha, dropout=dropout))
-        replaced.append(name)
-
-    if verbose:
-        print(f"Injected LoRA into {len(replaced)} attention modules")
-        for n in replaced:
-            print("  -", n)
-
-    if len(replaced) == 0:
-        raise RuntimeError("No attention modules were LoRA-wrapped. Check module names.")
-
-    return model
-
-
-def mark_only_lora_as_trainable(model: nn.Module, train_embeddings: bool = True):
-    for p in model.parameters():
-        p.requires_grad = False
-
-    for name, p in model.named_parameters():
-        is_lora = "lora_A" in name or "lora_B" in name
-        is_embedding = train_embeddings and "embed_tokens" in name
-        if is_lora or is_embedding:
-            p.requires_grad = True
-
-    return model
-
-
-def get_lora_state_dict(model: nn.Module):
-    return {
-        name: param.detach().cpu()
-        for name, param in model.named_parameters()
-        if ("lora_A" in name or "lora_B" in name or ("embed_tokens" in name and param.requires_grad))
-    }
-
-
-def save_lora(model: nn.Module, path: str, metadata: Optional[dict] = None):
-    payload = {
-        "state_dict": get_lora_state_dict(model),
-        "metadata": metadata or {},
-    }
-    torch.save(payload, path)
-
-
-def load_lora(model: nn.Module, path: str, map_location="cpu"):
-    payload = torch.load(path, map_location=map_location)
-    state_dict = payload["state_dict"] if "state_dict" in payload else payload
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    return missing, unexpected
-
-
-def build_lora_diffugpt(
-    base_ddm,
-    r=8,
-    lora_alpha=16,
-    dropout=0.05,
-    target_layers=None,
-    train_embeddings=True,
-):
-    inject_lora_attention_only(
-        base_ddm,
-        r=r,
-        lora_alpha=lora_alpha,
-        dropout=dropout,
-        target_layers=target_layers,
-        verbose=True,
-    )
-    mark_only_lora_as_trainable(base_ddm, train_embeddings=train_embeddings)
-    return base_ddm
 
 
 def build_samsum_prompt(dialogue: str) -> str:
@@ -222,28 +52,6 @@ def make_prompt_target(example: dict, dataset_name: str):
         return build_gsm8k_prompt(example["question"]), example["answer"]
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-# def extract_gsm8k_final_answer(answer_text: str) -> str:
-#     answer_text = answer_text.strip()
-#     if "####" in answer_text:
-#         final_answer = answer_text.split("####")[-1].strip()
-#     else:
-#         matches = re.findall(r"-?\d+(?:\.\d+)?", answer_text.replace(",", ""))
-#         final_answer = matches[-1] if matches else answer_text.strip()
-
-#     return final_answer.replace(",", "").rstrip(".")
-
-
-# def make_prompt_target(example: dict, dataset_name: str):
-#     if dataset_name == "samsum":
-#         return build_samsum_prompt(example["dialogue"]), example["summary"]
-
-#     if dataset_name == "gsm8k":
-#         prompt = build_gsm8k_prompt(example["question"])
-#         final_answer = extract_gsm8k_final_answer(example["answer"])
-#         target = final_answer
-#         return prompt, target
-
-    # raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 def encode_prompt_target(
     tokenizer,
@@ -419,11 +227,6 @@ class TrainConfig:
     warmup_steps: int
     weight_decay: float
     grad_clip: float
-    rank: int
-    lora_alpha: int
-    lora_dropout: float
-    target_layers: Optional[str]
-    train_embeddings: bool
     precision: str
     shift: bool
     sampling_eps: float
@@ -487,7 +290,7 @@ def autocast_context(device: torch.device, precision: str):
 def resolve_run_name(args):
     if args.run_name is not None:
         return args.run_name
-    return f"{args.dataset}-r{args.rank}-lr{args.lr:g}-bs{args.batch_size}"
+    return f"{args.dataset}-full-lr{args.lr:g}-bs{args.batch_size}"
 
 
 def sanitize_path_component(name: str):
@@ -524,6 +327,7 @@ def init_wandb(args, config: TrainConfig, trainable_params: int, total_params: i
             "model_name": args.model_name,
             "base_model_name": args.base_model_name,
             "load_mode": args.load_mode,
+            "finetune_mode": "full",
             "trainable_params": trainable_params,
             "total_params": total_params,
         },
@@ -719,23 +523,32 @@ def eval_generation_metrics(model, tokenizer, args, metric_examples, device, wan
     return metrics
 
 
-def save_checkpoint(model, args, config: TrainConfig, step: int, suffix: str):
+def save_full_checkpoint(model, args, config: TrainConfig, step: int, suffix: str):
     os.makedirs(args.output_dir, exist_ok=True)
-    save_path = os.path.join(args.output_dir, f"lora_{suffix}.pt")
-    save_lora(
-        model,
-        save_path,
-        metadata={
-            **asdict(config),
-            "step": step,
-            "model_name": args.model_name,
-            "base_model_name": args.base_model_name,
-            "load_mode": args.load_mode,
-            "target": "attention_only",
+    save_path = os.path.join(args.output_dir, f"full_{suffix}.pt")
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "metadata": {
+                **asdict(config),
+                "step": step,
+                "model_name": args.model_name,
+                "base_model_name": args.base_model_name,
+                "load_mode": args.load_mode,
+                "target": "full_finetune",
+            },
         },
+        save_path,
     )
     print(f"Saved {save_path}")
     return save_path
+
+
+def load_full_checkpoint(model, path: str, map_location="cpu"):
+    payload = torch.load(path, map_location=map_location)
+    state_dict = payload["state_dict"] if "state_dict" in payload else payload
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    return missing, unexpected
 
 
 def train(
@@ -851,20 +664,12 @@ def train(
             log_metrics(wandb_run, metrics, optimizer_step)
 
         if args.save_every > 0 and optimizer_step % args.save_every == 0:
-            save_checkpoint(model, args, config, optimizer_step, suffix=f"step{optimizer_step}")
+            save_full_checkpoint(model, args, config, optimizer_step, suffix=f"step{optimizer_step}")
 
     return model
 
 
-def print_lora_summary(model):
-    print("\nLoRA modules:")
-    count = 0
-    for name, module in model.named_modules():
-        if isinstance(module, LoRALayer):
-            print(f"  {name}: in={module.in_features}, out={module.out_features}")
-            count += 1
-    print(f"Total LoRA modules: {count}")
-
+def print_trainable_summary(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Trainable params: {trainable:,} / {total:,} ({100 * trainable / total:.4f}%)")
@@ -897,14 +702,14 @@ def load_diffugpt(args, tokenizer, config, device):
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Attention-only LoRA finetuning for DiffuGPT-medium with a DDM-SFT loss.",
+        description="Full finetuning for DiffuGPT-medium with the DDM-SFT loss.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument("--model_name", type=str, default="diffusionfamily/diffugpt-m")
     parser.add_argument("--base_model_name", type=str, default="gpt2-medium")
     parser.add_argument("--load_mode", choices=["ddm", "causal_lm"], default="ddm")
-    parser.add_argument("--resume_lora", type=str, default=None)
+    parser.add_argument("--resume_checkpoint", type=str, default=None)
 
     parser.add_argument("--dataset", choices=["samsum", "gsm8k"], default="samsum")
     parser.add_argument("--train_split", type=str, default=None)
@@ -912,13 +717,6 @@ def build_arg_parser():
     parser.add_argument("--max_train_samples", type=int, default=0)
     parser.add_argument("--max_eval_samples", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=0)
-
-    parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--lora_alpha", type=int, default=None)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--target_layers", type=str, default=None, help="Comma-separated layer ids, e.g. 0,1,2.")
-    parser.add_argument("--no_train_embeddings", action="store_false", dest="train_embeddings")
-    parser.set_defaults(train_embeddings=True)
 
     parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -945,7 +743,7 @@ def build_arg_parser():
     parser.add_argument("--metric_logits_temp", type=float, default=0.95)
     parser.add_argument("--metric_topp_temp", type=float, default=0.9)
     parser.add_argument("--save_every", type=int, default=2000)
-    parser.add_argument("--output_dir", type=str, default="output/diffugpt-m-lora")
+    parser.add_argument("--output_dir", type=str, default="output/diffugpt-m-full")
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--wandb", action="store_true", default=True)
@@ -960,8 +758,6 @@ def build_arg_parser():
 def main():
     args = build_arg_parser().parse_args()
 
-    if args.lora_alpha is None:
-        args.lora_alpha = 2 * args.rank
     if args.train_split is None:
         args.train_split = dataset_default_split(args.dataset, train=True)
     if args.eval_split is None:
@@ -987,20 +783,15 @@ def main():
         raise ValueError("Tokenizer has no mask token. Expected a DiffuGPT tokenizer.")
 
     ddm = load_diffugpt(args, tokenizer=tokenizer, config=config, device=device)
-    ddm = build_lora_diffugpt(
-        ddm,
-        r=args.rank,
-        lora_alpha=args.lora_alpha,
-        dropout=args.lora_dropout,
-        target_layers=parse_target_layers(args.target_layers),
-        train_embeddings=args.train_embeddings,
-    )
 
-    if args.resume_lora:
-        missing, unexpected = load_lora(ddm, args.resume_lora, map_location="cpu")
-        print(f"Loaded LoRA from {args.resume_lora}; missing={len(missing)}, unexpected={len(unexpected)}")
+    if args.resume_checkpoint:
+        missing, unexpected = load_full_checkpoint(ddm, args.resume_checkpoint, map_location="cpu")
+        print(
+            f"Loaded full checkpoint from {args.resume_checkpoint}; "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
 
-    trainable_params, total_params = print_lora_summary(ddm)
+    trainable_params, total_params = print_trainable_summary(ddm)
 
     pin_memory = device.type == "cuda"
     train_loader = make_supervised_dataloader(
@@ -1044,11 +835,6 @@ def main():
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
-        rank=args.rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_layers=args.target_layers,
-        train_embeddings=args.train_embeddings,
         precision=precision,
         shift=args.shift,
         sampling_eps=args.sampling_eps,
@@ -1080,7 +866,7 @@ def main():
         wandb_run=wandb_run,
     )
 
-    save_checkpoint(ddm, args, train_config, args.steps, suffix="final")
+    save_full_checkpoint(ddm, args, train_config, args.steps, suffix="final")
     if wandb_run is not None:
         wandb_run.finish()
 
