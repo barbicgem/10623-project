@@ -215,11 +215,17 @@ def build_gsm8k_prompt(question: str) -> str:
     return f"Question: {question}\nAnswer:"
 
 
+def build_arithmetic_prompt(question: str) -> str:
+    return f"{question}\nAnswer:"
+
+
 def make_prompt_target(example: dict, dataset_name: str):
     if dataset_name == "samsum":
         return build_samsum_prompt(example["dialogue"]), example["summary"]
     if dataset_name == "gsm8k":
         return build_gsm8k_prompt(example["question"]), example["answer"]
+    if dataset_name == "arithmetic":
+        return build_arithmetic_prompt(example["question"]), example["answer"]
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 # def extract_gsm8k_final_answer(answer_text: str) -> str:
@@ -292,16 +298,36 @@ def dataset_default_split(dataset_name: str, train: bool):
         return "train" if train else "validation"
     if dataset_name == "gsm8k":
         return "train" if train else "test"
+    if dataset_name == "arithmetic":
+        return "train" if train else "test"
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
-def load_named_dataset(dataset_name: str, split: str):
-    from datasets import load_dataset
+# Arithmetic subtasks to sample from (simple add/sub/mul/div only)
+_ARITHMETIC_SUBTASKS = [
+    "arithmetic__add_or_sub",
+    "arithmetic__add_or_sub_multiple",
+    "arithmetic__mul_div_remainder",
+]
+
+
+def load_named_dataset(dataset_name: str, split: str, max_samples_per_subtask: int = 0):
+    from datasets import load_dataset, concatenate_datasets
 
     if dataset_name == "samsum":
         return load_dataset("knkarthick/samsum", split=split)
     if dataset_name == "gsm8k":
         return load_dataset("openai/gsm8k", "main", split=split)
+    if dataset_name == "arithmetic":
+        parts = []
+        for subtask in _ARITHMETIC_SUBTASKS:
+            ds = load_dataset("deepmind/math_dataset", subtask, split=split, trust_remote_code=True)
+            if max_samples_per_subtask > 0:
+                ds = ds.select(range(min(max_samples_per_subtask, len(ds))))
+            parts.append(ds)
+        combined = concatenate_datasets(parts)
+        combined = combined.shuffle(seed=42)
+        return combined
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -313,11 +339,12 @@ def make_supervised_dataloader(
     batch_size: int,
     min_target_tokens: int,
     max_samples: int = 0,
+    arithmetic_samples_per_subtask: int = 0,
     shuffle: bool = True,
     num_workers: int = 0,
     pin_memory: bool = False,
 ):
-    ds = load_named_dataset(dataset_name, split)
+    ds = load_named_dataset(dataset_name, split, max_samples_per_subtask=arithmetic_samples_per_subtask)
     if max_samples and max_samples > 0:
         ds = ds.select(range(min(max_samples, len(ds))))
 
@@ -705,7 +732,7 @@ def eval_generation_metrics(model, tokenizer, args, metric_examples, device, wan
         rouge_l = compute_rouge_l(predictions, references)
         if rouge_l is not None:
             metrics["metric/rougeL"] = rouge_l
-    elif args.dataset == "gsm8k":
+    elif args.dataset in ("gsm8k", "arithmetic"):
         correct = 0
         for pred, ref in zip(predictions, references):
             correct += int(extract_gsm_answer(pred) == extract_gsm_answer(ref))
@@ -906,7 +933,9 @@ def build_arg_parser():
     parser.add_argument("--load_mode", choices=["ddm", "causal_lm"], default="ddm")
     parser.add_argument("--resume_lora", type=str, default=None)
 
-    parser.add_argument("--dataset", choices=["samsum", "gsm8k"], default="samsum")
+    parser.add_argument("--dataset", choices=["samsum", "gsm8k", "arithmetic"], default="samsum")
+    parser.add_argument("--arithmetic_samples_per_subtask", type=int, default=3500,
+                        help="Examples per subtask for arithmetic (3 subtasks × default=3500 → ~10k train)")
     parser.add_argument("--train_split", type=str, default=None)
     parser.add_argument("--eval_split", type=str, default=None)
     parser.add_argument("--max_train_samples", type=int, default=0)
@@ -1011,6 +1040,7 @@ def main():
         batch_size=args.batch_size,
         min_target_tokens=args.min_target_tokens,
         max_samples=args.max_train_samples,
+        arithmetic_samples_per_subtask=args.arithmetic_samples_per_subtask,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
@@ -1025,6 +1055,7 @@ def main():
             batch_size=args.batch_size,
             min_target_tokens=args.min_target_tokens,
             max_samples=args.max_eval_samples,
+            arithmetic_samples_per_subtask=700,  # ~2k val across 3 subtasks
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=pin_memory,
