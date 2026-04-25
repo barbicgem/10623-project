@@ -321,9 +321,8 @@ def load_named_dataset(dataset_name: str, split: str, max_samples_per_subtask: i
     if dataset_name == "arithmetic":
         parts = []
         for subtask in _ARITHMETIC_SUBTASKS:
-            ds = load_dataset("deepmind/math_dataset", subtask, split=split, trust_remote_code=True)
-            if max_samples_per_subtask > 0:
-                ds = ds.select(range(min(max_samples_per_subtask, len(ds))))
+            split_str = f"{split}[:{max_samples_per_subtask}]" if max_samples_per_subtask > 0 else split
+            ds = load_dataset("deepmind/math_dataset", subtask, split=split_str, trust_remote_code=True)
             parts.append(ds)
         combined = concatenate_datasets(parts)
         combined = combined.shuffle(seed=42)
