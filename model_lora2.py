@@ -306,8 +306,8 @@ def dataset_default_split(dataset_name: str, train: bool):
 # Arithmetic subtasks to sample from (simple add/sub/mul/div only)
 _ARITHMETIC_SUBTASKS = [
     "arithmetic__add_or_sub",
-    "arithmetic__add_or_sub_multiple",
-    "arithmetic__mul_div_remainder",
+    "arithmetic__add_sub_multiple",
+    "arithmetic__mul",
 ]
 
 
