@@ -56,9 +56,7 @@ def make_prompt_target(example: dict, dataset_name: str):
 
 
 def default_eval_split(dataset_name: str) -> str:
-    if dataset_name == "samsum":
-        return "validation"
-    if dataset_name in ("gsm8k", "arithmetic"):
+    if dataset_name in ("samsum", "gsm8k", "arithmetic"):
         return "test"
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
