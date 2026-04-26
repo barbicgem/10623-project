@@ -113,6 +113,23 @@ def parse_dataset_list(value: str):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def parse_metric_list(value: str):
+    metrics = [item.strip().lower() for item in value.split(",") if item.strip()]
+    aliases = {"rougel": "rougeL", "rouge_l": "rougeL", "bertscore": "bertscore"}
+    parsed = []
+    for metric in metrics:
+        if metric not in aliases:
+            raise argparse.ArgumentTypeError(
+                f"Unsupported SAMSum metric '{metric}'. Use rougeL, bertscore, or both."
+            )
+        normalized = aliases[metric]
+        if normalized not in parsed:
+            parsed.append(normalized)
+    if not parsed:
+        raise argparse.ArgumentTypeError("At least one SAMSum metric is required.")
+    return parsed
+
+
 def read_checkpoint(path: str):
     payload = torch.load(path, map_location="cpu")
     metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
@@ -171,6 +188,31 @@ def raw_example_payload(example: dict, dataset_name: str):
     if dataset_name in ("gsm8k", "arithmetic"):
         return {"question": example["question"]}
     return {}
+
+
+def compute_bertscore(predictions, references, model_type: str):
+    try:
+        import evaluate
+    except ImportError:
+        print("evaluate is not installed; skipping BERTScore metric.")
+        return {}
+
+    bertscore = evaluate.load("bertscore")
+    scores = bertscore.compute(
+        predictions=predictions,
+        references=references,
+        lang="en",
+        model_type=model_type,
+    )
+
+    def mean(values):
+        return 100.0 * sum(float(value) for value in values) / max(1, len(values))
+
+    return {
+        "bertscore_precision": mean(scores["precision"]),
+        "bertscore_recall": mean(scores["recall"]),
+        "bertscore_f1": mean(scores["f1"]),
+    }
 
 
 def evaluate_dataset(model, tokenizer, args, dataset_name: str, device):
@@ -239,12 +281,27 @@ def evaluate_dataset(model, tokenizer, args, dataset_name: str, device):
 
     metrics = {"dataset": dataset_name, "split": split, "examples": len(predictions)}
     if dataset_name == "samsum":
-        rouge_l = compute_rouge_l(predictions, references)
-        metrics["rougeL"] = rouge_l
-        if rouge_l is not None:
-            print(f"{dataset_name}: ROUGE-L {rouge_l:.2f}")
-        else:
-            print(f"{dataset_name}: ROUGE-L unavailable")
+        if "rougeL" in args.samsum_metrics:
+            rouge_l = compute_rouge_l(predictions, references)
+            metrics["rougeL"] = rouge_l
+            if rouge_l is not None:
+                print(f"{dataset_name}: ROUGE-L {rouge_l:.2f}")
+            else:
+                print(f"{dataset_name}: ROUGE-L unavailable")
+
+        if "bertscore" in args.samsum_metrics:
+            bertscore_metrics = compute_bertscore(
+                predictions,
+                references,
+                model_type=args.bertscore_model_type,
+            )
+            metrics.update(bertscore_metrics)
+            if bertscore_metrics:
+                print(
+                    f"{dataset_name}: BERTScore F1 {bertscore_metrics['bertscore_f1']:.2f} "
+                    f"(P {bertscore_metrics['bertscore_precision']:.2f}, "
+                    f"R {bertscore_metrics['bertscore_recall']:.2f})"
+                )
     elif dataset_name in ("gsm8k", "arithmetic"):
         exact_match = 100.0 * correct / max(1, len(references))
         metrics["exact_match"] = exact_match
@@ -280,6 +337,13 @@ def main():
     parser.add_argument("--metric_max_new_tokens", type=int, default=128)
     parser.add_argument("--metric_logits_temp", type=float, default=0.95)
     parser.add_argument("--metric_topp_temp", type=float, default=0.9)
+    parser.add_argument(
+        "--samsum_metrics",
+        type=parse_metric_list,
+        default=parse_metric_list("rougeL,bertscore"),
+        help="Comma-separated SAMSum metrics: rougeL, bertscore, or both.",
+    )
+    parser.add_argument("--bertscore_model_type", type=str, default="microsoft/deberta-xlarge-mnli")
     parser.add_argument("--shift", action="store_true", default=None)
     parser.add_argument("--no_shift", action="store_false", dest="shift")
 
@@ -322,6 +386,8 @@ def main():
             "metric_topp_temp": args.metric_topp_temp,
             "max_len": args.max_len,
             "shift": args.shift,
+            "samsum_metrics": args.samsum_metrics,
+            "bertscore_model_type": args.bertscore_model_type,
         },
         "results": {},
     }
