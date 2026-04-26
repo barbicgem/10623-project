@@ -152,6 +152,14 @@ def apply_metadata_defaults(args, metadata: dict):
         raise ValueError("--trained_dataset is required when checkpoint metadata does not include dataset.")
 
 
+def default_output_prefix(checkpoint_path: str) -> str:
+    checkpoint = Path(checkpoint_path)
+    parent = checkpoint.parent.name
+    if parent:
+        return f"{parent}_{checkpoint.stem}"
+    return checkpoint.stem
+
+
 def build_model(args, state_dict, device):
     from transformers import AutoConfig, AutoTokenizer
 
@@ -356,7 +364,7 @@ def main():
     if args.eval_datasets is None:
         args.eval_datasets = default_eval_datasets(args.trained_dataset)
     if args.output_prefix is None:
-        args.output_prefix = Path(args.checkpoint).stem
+        args.output_prefix = default_output_prefix(args.checkpoint)
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(
