@@ -215,8 +215,9 @@ def build_gsm8k_prompt(question: str) -> str:
     return f"Question: {question}\nAnswer:"
 
 
-def build_arithmetic_prompt(question: str) -> str:
-    return f"{question}\nAnswer:"
+def _decode_field(v):
+    """Decode bytes to str if needed (deepmind/math_dataset returns bytes)."""
+    return v.decode("utf-8") if isinstance(v, bytes) else v
 
 
 def make_prompt_target(example: dict, dataset_name: str):
@@ -225,7 +226,11 @@ def make_prompt_target(example: dict, dataset_name: str):
     if dataset_name == "gsm8k":
         return build_gsm8k_prompt(example["question"]), example["answer"]
     if dataset_name == "arithmetic":
-        return build_arithmetic_prompt(example["question"]), example["answer"]
+        question = _decode_field(example["question"]).strip()
+        answer = _decode_field(example["answer"]).strip()
+        return build_gsm8k_prompt(question), answer
+    if dataset_name == "eleuther_arithmetic":
+        return _decode_field(example["context"]).strip(), _decode_field(example["completion"]).strip()
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 # def extract_gsm8k_final_answer(answer_text: str) -> str:
@@ -300,6 +305,8 @@ def dataset_default_split(dataset_name: str, train: bool):
         return "train" if train else "test"
     if dataset_name == "arithmetic":
         return "train" if train else "test"
+    if dataset_name == "eleuther_arithmetic":
+        return "train" if train else "test"
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -309,6 +316,41 @@ _ARITHMETIC_SUBTASKS = [
     "arithmetic__add_sub_multiple",
     "arithmetic__mul",
 ]
+
+
+# All EleutherAI/arithmetic configs (each has 2000 examples in validation split)
+_ELEUTHER_ARITHMETIC_CONFIGS = [
+    "arithmetic_1dc", "arithmetic_2da", "arithmetic_2dm", "arithmetic_2ds",
+    "arithmetic_3da", "arithmetic_3ds", "arithmetic_4da", "arithmetic_4ds",
+    "arithmetic_5da", "arithmetic_5ds",
+]
+
+_ELEUTHER_SPLIT_CACHE = {}
+
+
+def _load_eleuther_arithmetic(split: str):
+    """Load all EleutherAI/arithmetic configs, combine, and return train/val/test split."""
+    from datasets import load_dataset, concatenate_datasets
+
+    if split not in _ELEUTHER_SPLIT_CACHE:
+        parts = []
+        for config in _ELEUTHER_ARITHMETIC_CONFIGS:
+            ds = load_dataset("EleutherAI/arithmetic", config, split="validation")
+            parts.append(ds)
+        combined = concatenate_datasets(parts).shuffle(seed=42)
+
+        n = len(combined)
+        n_test  = int(0.1 * n)
+        n_val   = int(0.1 * n)
+        n_train = n - n_test - n_val
+
+        _ELEUTHER_SPLIT_CACHE["train"]      = combined.select(range(n_train))
+        _ELEUTHER_SPLIT_CACHE["validation"] = combined.select(range(n_train, n_train + n_val))
+        _ELEUTHER_SPLIT_CACHE["test"]       = combined.select(range(n_train + n_val, n))
+
+        print(f"EleutherAI/arithmetic — train: {n_train}, val: {n_val}, test: {n_test}")
+
+    return _ELEUTHER_SPLIT_CACHE[split]
 
 
 def load_named_dataset(dataset_name: str, split: str, max_samples_per_subtask: int = 0):
@@ -327,6 +369,8 @@ def load_named_dataset(dataset_name: str, split: str, max_samples_per_subtask: i
         combined = concatenate_datasets(parts)
         combined = combined.shuffle(seed=42)
         return combined
+    if dataset_name == "eleuther_arithmetic":
+        return _load_eleuther_arithmetic(split)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -731,7 +775,7 @@ def eval_generation_metrics(model, tokenizer, args, metric_examples, device, wan
         rouge_l = compute_rouge_l(predictions, references)
         if rouge_l is not None:
             metrics["metric/rougeL"] = rouge_l
-    elif args.dataset in ("gsm8k", "arithmetic"):
+    elif args.dataset in ("gsm8k", "arithmetic", "eleuther_arithmetic"):
         correct = 0
         for pred, ref in zip(predictions, references):
             correct += int(extract_gsm_answer(pred) == extract_gsm_answer(ref))
@@ -932,7 +976,7 @@ def build_arg_parser():
     parser.add_argument("--load_mode", choices=["ddm", "causal_lm"], default="ddm")
     parser.add_argument("--resume_lora", type=str, default=None)
 
-    parser.add_argument("--dataset", choices=["samsum", "gsm8k", "arithmetic"], default="samsum")
+    parser.add_argument("--dataset", choices=["samsum", "gsm8k", "arithmetic", "eleuther_arithmetic"], default="samsum")
     parser.add_argument("--arithmetic_samples_per_subtask", type=int, default=3500,
                         help="Examples per subtask for arithmetic (3 subtasks × default=3500 → ~10k train)")
     parser.add_argument("--train_split", type=str, default=None)

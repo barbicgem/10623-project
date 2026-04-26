@@ -88,7 +88,7 @@ def evaluate(ddm, tokenizer, args, device):
             print(f"  ROUGE-L: {rouge_l:.2f}")
         return {"rougeL": rouge_l}
 
-    elif args.dataset in ("gsm8k", "arithmetic"):
+    elif args.dataset in ("gsm8k", "arithmetic", "eleuther_arithmetic"):
         correct = sum(
             int(extract_gsm_answer(pred) == extract_gsm_answer(ref))
             for pred, ref in zip(predictions, references)
@@ -103,7 +103,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--lora_alpha", type=int, default=None, help="Defaults to 2 * rank")
-    parser.add_argument("--dataset", choices=["samsum", "gsm8k", "arithmetic"], default="samsum")
+    parser.add_argument("--dataset", choices=["samsum", "gsm8k", "arithmetic", "eleuther_arithmetic"], default="samsum")
     parser.add_argument("--model_name", type=str, default="diffusionfamily/diffugpt-m")
     parser.add_argument("--max_len", type=int, default=384)
     parser.add_argument("--max_examples", type=int, default=None)
