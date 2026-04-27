@@ -11,6 +11,7 @@ Metrics:
 """
 
 import argparse
+import json
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -113,6 +114,7 @@ if __name__ == "__main__":
     parser.add_argument("--metric_topp_temp", type=float, default=0.9)
     parser.add_argument("--shift", action="store_true", default=True)
     parser.add_argument("--no_shift", action="store_false", dest="shift")
+    parser.add_argument("--output_json", type=str, default=None, help="If set, save metrics dict as JSON to this path")
     args = parser.parse_args()
 
     if args.lora_alpha is None:
@@ -125,4 +127,10 @@ if __name__ == "__main__":
         args.model_name, args.rank, args.lora_alpha, args.checkpoint, device
     )
 
-    evaluate(ddm, tokenizer, args, device)
+    metrics = evaluate(ddm, tokenizer, args, device)
+
+    if args.output_json and metrics:
+        payload = {"dataset": args.dataset, "rank": args.rank, **metrics}
+        with open(args.output_json, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"Saved metrics to {args.output_json}")
