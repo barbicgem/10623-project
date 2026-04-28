@@ -3,8 +3,6 @@
 # Writes per-run JSON to {run_dir}/eval_result.json
 # Usage: bash eval_sweep_all.sh
 
-set -e
-
 OUTPUT_BASE="output/sweep"
 RANKS=(1 2 4 8 16 32)
 MAX_EXAMPLES=500   # set to -1 for full test set (slow)
@@ -13,11 +11,19 @@ for DATASET in arithmetic eleuther_arithmetic; do
     for RANK in "${RANKS[@]}"; do
         RUN_DIR="${OUTPUT_BASE}/${DATASET}-r${RANK}-lr2e-05-bs16"
 
-        # Find the checkpoint with the highest step number
-        CKPT=$(ls ${RUN_DIR}/lora_step*.pt 2>/dev/null | sort -V | tail -1)
+        # Try checkpoints from highest step to lowest, skip corrupted ones
+        CKPT=""
+        for CANDIDATE in $(ls ${RUN_DIR}/lora_step*.pt 2>/dev/null | sort -V -r); do
+            if python3 -c "import torch; torch.load('${CANDIDATE}', map_location='cpu')" 2>/dev/null; then
+                CKPT="${CANDIDATE}"
+                break
+            else
+                echo "WARNING: ${CANDIDATE} is corrupted, trying previous checkpoint"
+            fi
+        done
 
         if [ -z "$CKPT" ]; then
-            echo "WARNING: no checkpoint found in ${RUN_DIR}, skipping"
+            echo "WARNING: no valid checkpoint found in ${RUN_DIR}, skipping"
             continue
         fi
 
@@ -26,7 +32,7 @@ for DATASET in arithmetic eleuther_arithmetic; do
         echo "Checkpoint: ${CKPT}"
         echo "========================================"
 
-        python eval_lora.py \
+        python3 eval_lora.py \
             --checkpoint        ${CKPT} \
             --rank              ${RANK} \
             --dataset           ${DATASET} \
@@ -47,7 +53,7 @@ echo "========================================"
 
 echo "######################################## Plotting"
 
-python plot_sweep.py \
+python3 plot_sweep.py \
     --output_dir ${OUTPUT_BASE} \
     --save_path  ${OUTPUT_BASE}/sweep_accuracy.png
 
