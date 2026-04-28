@@ -27,6 +27,11 @@ for DATASET in arithmetic eleuther_arithmetic; do
             continue
         fi
 
+        if [ -f "${RUN_DIR}/eval_result.json" ]; then
+            echo "Skipping dataset=${DATASET} rank=${RANK} — eval_result.json already exists"
+            continue
+        fi
+
         echo "========================================"
         echo "Evaluating dataset=${DATASET} rank=${RANK}"
         echo "Checkpoint: ${CKPT}"
