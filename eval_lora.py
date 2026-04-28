@@ -13,7 +13,7 @@ Metrics:
 import argparse
 import json
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 import transformers.models.llama.modeling_llama as _llama
 if not hasattr(_llama, "LlamaFlashAttention2"):
@@ -31,13 +31,19 @@ from model_lora2 import (
 )
 
 
-def build_model(model_name, rank, lora_alpha, checkpoint_path, device):
+def build_model(model_name, rank, lora_alpha, checkpoint_path, device, base_model_name="gpt2-medium"):
     config = AutoConfig.from_pretrained(model_name)
-    backbone = AutoModelForCausalLM.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    backbone.config.use_cache = False
-    ddm = DiscreteDiffusionModel(backbone, config, tokenizer, device=device)
+    # Must use DiscreteDiffusionModel.from_pretrained (same as training load_mode=ddm).
+    # AutoModelForCausalLM.from_pretrained does not correctly load diffugpt-m weights.
+    ddm = DiscreteDiffusionModel.from_pretrained(
+        model_name,
+        model=base_model_name,
+        config=config,
+        tokenizer=tokenizer,
+        device=device,
+    )
     ddm = build_lora_diffugpt(ddm, r=rank, lora_alpha=lora_alpha)
 
     missing, unexpected = load_lora(ddm, checkpoint_path)
@@ -106,6 +112,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_alpha", type=int, default=None, help="Defaults to 2 * rank")
     parser.add_argument("--dataset", choices=["samsum", "gsm8k", "arithmetic", "eleuther_arithmetic"], default="samsum")
     parser.add_argument("--model_name", type=str, default="diffusionfamily/diffugpt-m")
+    parser.add_argument("--base_model_name", type=str, default="gpt2-medium")
     parser.add_argument("--max_len", type=int, default=384)
     parser.add_argument("--max_examples", type=int, default=None)
     parser.add_argument("--metric_diffusion_steps", type=int, default=64)
@@ -124,7 +131,8 @@ if __name__ == "__main__":
     print(f"Device: {device} | dataset={args.dataset} | rank={args.rank}")
 
     ddm, tokenizer = build_model(
-        args.model_name, args.rank, args.lora_alpha, args.checkpoint, device
+        args.model_name, args.rank, args.lora_alpha, args.checkpoint, device,
+        base_model_name=args.base_model_name,
     )
 
     metrics = evaluate(ddm, tokenizer, args, device)
