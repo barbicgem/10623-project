@@ -44,3 +44,11 @@ echo "========================================"
 echo "All evaluations complete."
 echo "Results in ${OUTPUT_BASE}/*/eval_result.json"
 echo "========================================"
+
+echo "######################################## Plotting"
+
+python plot_sweep.py \
+    --output_dir ${OUTPUT_BASE} \
+    --save_path  ${OUTPUT_BASE}/sweep_accuracy.png
+
+echo "Plot saved to ${OUTPUT_BASE}/sweep_accuracy.png"

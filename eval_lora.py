@@ -35,8 +35,6 @@ def build_model(model_name, rank, lora_alpha, checkpoint_path, device, base_mode
     config = AutoConfig.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Must use DiscreteDiffusionModel.from_pretrained (same as training load_mode=ddm).
-    # AutoModelForCausalLM.from_pretrained does not correctly load diffugpt-m weights.
     ddm = DiscreteDiffusionModel.from_pretrained(
         model_name,
         model=base_model_name,
@@ -47,8 +45,17 @@ def build_model(model_name, rank, lora_alpha, checkpoint_path, device, base_mode
     ddm = build_lora_diffugpt(ddm, r=rank, lora_alpha=lora_alpha)
 
     missing, unexpected = load_lora(ddm, checkpoint_path)
-    if missing:
-        print(f"Warning: {len(missing)} missing keys when loading LoRA checkpoint")
+    # 'missing' = backbone params not saved (expected — only LoRA+embed_tokens are saved)
+    # 'unexpected' = checkpoint keys not found in model (BAD — means LoRA didn't load)
+    lora_missing = [k for k in missing if "lora_A" in k or "lora_B" in k]
+    if lora_missing:
+        print(f"ERROR: {len(lora_missing)} LoRA keys missing from checkpoint — weights not loaded!")
+        print("  First few:", lora_missing[:4])
+    else:
+        print(f"LoRA loaded OK ({len(missing)} backbone keys not in checkpoint, as expected)")
+    if unexpected:
+        print(f"WARNING: {len(unexpected)} unexpected keys in checkpoint (key mismatch — LoRA may not have loaded)")
+        print("  First few:", unexpected[:4])
     ddm = ddm.to(device)
     ddm.eval()
     return ddm, tokenizer
