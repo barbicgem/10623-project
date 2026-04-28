@@ -5,7 +5,7 @@
 
 OUTPUT_BASE="output/sweep"
 RANKS=(1 2 4 8 16 32)
-MAX_EXAMPLES=500   # set to -1 for full test set (slow)
+MAX_EXAMPLES=2000
 
 # ── Baseline (no LoRA) ──────────────────────────────────────────
 for DATASET in arithmetic eleuther_arithmetic; do

@@ -1,6 +1,6 @@
 """
-Plot exact-match accuracy vs LoRA rank, one figure per dataset.
-Baseline (no LoRA) shown as a horizontal dashed line.
+Bar chart of exact-match accuracy for baseline + selected LoRA ranks.
+One figure per dataset.
 
 Usage:
     python plot_sweep.py --output_dir output/sweep --save_dir output/sweep
@@ -11,6 +11,10 @@ import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
+
+
+PLOT_RANKS = [4, 8, 16, 32]
 
 
 def load_results(output_dir: str):
@@ -41,30 +45,37 @@ def load_results(output_dir: str):
 
 
 def plot_dataset(dataset, rank_scores, baseline_score, save_path):
-    fig, ax = plt.subplots(figsize=(7, 5))
-
-    ranks = sorted(rank_scores.keys())
-    scores = [rank_scores[r] for r in ranks]
-
-    ax.plot(ranks, scores, marker="o", color="#1f77b4", linewidth=2,
-            markersize=8, label="LoRA fine-tuned")
-    for r, s in zip(ranks, scores):
-        ax.annotate(f"{s:.1f}", (r, s), textcoords="offset points",
-                    xytext=(0, 8), ha="center", fontsize=8)
+    labels = ["Baseline"] + [f"r={r}" for r in PLOT_RANKS]
+    values = []
 
     if baseline_score is not None:
-        ax.axhline(baseline_score, color="#d62728", linestyle="--", linewidth=1.5,
-                   label=f"Baseline (no LoRA): {baseline_score:.1f}%")
+        values.append(baseline_score)
+    else:
+        values.append(0.0)
+        print(f"Warning: no baseline for {dataset}, using 0")
+
+    for r in PLOT_RANKS:
+        values.append(rank_scores.get(r, 0.0))
+        if r not in rank_scores:
+            print(f"Warning: no result for {dataset} rank={r}, using 0")
+
+    colors = ["#d62728"] + ["#1f77b4"] * len(PLOT_RANKS)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    x = np.arange(len(labels))
+    bars = ax.bar(x, values, color=colors, width=0.55, edgecolor="white")
+
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                f"{val:.1f}%", ha="center", va="bottom", fontsize=9)
 
     title = dataset.replace("_", " ").title()
-    ax.set_xlabel("LoRA Rank", fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=11)
     ax.set_ylabel("Exact Match (%)", fontsize=12)
     ax.set_title(f"DiffuGPT LoRA — {title}", fontsize=13)
-    ax.set_xscale("log", base=2)
-    ax.set_xticks(ranks)
-    ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, max(values) * 1.25 + 1)
+    ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     print(f"Saved plot to {save_path}")
@@ -74,8 +85,7 @@ def plot_dataset(dataset, rank_scores, baseline_score, save_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, default="output/sweep")
-    parser.add_argument("--save_dir", type=str, default=None,
-                        help="Directory to save plots (defaults to output_dir)")
+    parser.add_argument("--save_dir", type=str, default=None)
     args = parser.parse_args()
 
     save_dir = Path(args.save_dir or args.output_dir)
