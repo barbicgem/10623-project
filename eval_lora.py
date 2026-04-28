@@ -31,7 +31,7 @@ from model_lora2 import (
 )
 
 
-def build_model(model_name, rank, lora_alpha, checkpoint_path, device, base_model_name="gpt2-medium"):
+def build_model(model_name, rank, lora_alpha, checkpoint_path, device, base_model_name="gpt2-medium", baseline=False):
     config = AutoConfig.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -42,20 +42,22 @@ def build_model(model_name, rank, lora_alpha, checkpoint_path, device, base_mode
         tokenizer=tokenizer,
         device=device,
     )
-    ddm = build_lora_diffugpt(ddm, r=rank, lora_alpha=lora_alpha)
 
-    missing, unexpected = load_lora(ddm, checkpoint_path)
-    # 'missing' = backbone params not saved (expected — only LoRA+embed_tokens are saved)
-    # 'unexpected' = checkpoint keys not found in model (BAD — means LoRA didn't load)
-    lora_missing = [k for k in missing if "lora_A" in k or "lora_B" in k]
-    if lora_missing:
-        print(f"ERROR: {len(lora_missing)} LoRA keys missing from checkpoint — weights not loaded!")
-        print("  First few:", lora_missing[:4])
+    if not baseline:
+        ddm = build_lora_diffugpt(ddm, r=rank, lora_alpha=lora_alpha)
+        missing, unexpected = load_lora(ddm, checkpoint_path)
+        lora_missing = [k for k in missing if "lora_A" in k or "lora_B" in k]
+        if lora_missing:
+            print(f"ERROR: {len(lora_missing)} LoRA keys missing from checkpoint — weights not loaded!")
+            print("  First few:", lora_missing[:4])
+        else:
+            print(f"LoRA loaded OK ({len(missing)} backbone keys not in checkpoint, as expected)")
+        if unexpected:
+            print(f"WARNING: {len(unexpected)} unexpected keys in checkpoint (key mismatch — LoRA may not have loaded)")
+            print("  First few:", unexpected[:4])
     else:
-        print(f"LoRA loaded OK ({len(missing)} backbone keys not in checkpoint, as expected)")
-    if unexpected:
-        print(f"WARNING: {len(unexpected)} unexpected keys in checkpoint (key mismatch — LoRA may not have loaded)")
-        print("  First few:", unexpected[:4])
+        print("Baseline mode — no LoRA, using base DiffuGPT weights only")
+
     ddm = ddm.to(device)
     ddm.eval()
     return ddm, tokenizer
@@ -114,8 +116,10 @@ def evaluate(ddm, tokenizer, args, device):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--rank", type=int, required=True)
+    parser.add_argument("--baseline", action="store_true", default=False,
+                        help="Evaluate base DiffuGPT with no LoRA (ignores --checkpoint and --rank)")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--lora_alpha", type=int, default=None, help="Defaults to 2 * rank")
     parser.add_argument("--dataset", choices=["samsum", "gsm8k", "arithmetic", "eleuther_arithmetic"], default="samsum")
     parser.add_argument("--model_name", type=str, default="diffusionfamily/diffugpt-m")
@@ -131,21 +135,28 @@ if __name__ == "__main__":
     parser.add_argument("--output_json", type=str, default=None, help="If set, save metrics dict as JSON to this path")
     args = parser.parse_args()
 
-    if args.lora_alpha is None:
+    if not args.baseline and args.checkpoint is None:
+        parser.error("--checkpoint is required unless --baseline is set")
+    if not args.baseline and args.rank is None:
+        parser.error("--rank is required unless --baseline is set")
+
+    if args.lora_alpha is None and args.rank is not None:
         args.lora_alpha = 2 * args.rank
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} | dataset={args.dataset} | rank={args.rank}")
+    mode = "baseline" if args.baseline else f"rank={args.rank}"
+    print(f"Device: {device} | dataset={args.dataset} | {mode}")
 
     ddm, tokenizer = build_model(
         args.model_name, args.rank, args.lora_alpha, args.checkpoint, device,
         base_model_name=args.base_model_name,
+        baseline=args.baseline,
     )
 
     metrics = evaluate(ddm, tokenizer, args, device)
 
     if args.output_json and metrics:
-        payload = {"dataset": args.dataset, "rank": args.rank, **metrics}
+        payload = {"dataset": args.dataset, "rank": args.rank, "baseline": args.baseline, **metrics}
         with open(args.output_json, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"Saved metrics to {args.output_json}")

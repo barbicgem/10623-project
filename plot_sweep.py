@@ -1,10 +1,9 @@
 """
-Plot exact-match accuracy vs LoRA rank for each dataset.
+Plot exact-match accuracy vs LoRA rank, one figure per dataset.
+Baseline (no LoRA) shown as a horizontal dashed line.
 
 Usage:
-    python plot_sweep.py --output_dir output/sweep --save_path sweep_accuracy.png
-
-Reads eval_result.json files written by eval_sweep_all.sh.
+    python plot_sweep.py --output_dir output/sweep --save_dir output/sweep
 """
 
 import argparse
@@ -15,59 +14,79 @@ import matplotlib.pyplot as plt
 
 
 def load_results(output_dir: str):
-    results = {}
+    lora_results = {}   # {dataset: {rank: exact_match}}
+    baseline_results = {}  # {dataset: exact_match}
+
     for result_file in sorted(Path(output_dir).glob("*/eval_result.json")):
         with open(result_file) as f:
             data = json.load(f)
+
         dataset = data.get("dataset")
         rank = data.get("rank")
         exact_match = data.get("exact_match")
-        if dataset is None or rank is None or exact_match is None:
-            print(f"Skipping {result_file} (missing fields: {data})")
+        is_baseline = data.get("baseline", False)
+
+        if dataset is None or exact_match is None:
+            print(f"Skipping {result_file} (missing fields)")
             continue
-        results.setdefault(dataset, {})[rank] = exact_match
-        print(f"Loaded: dataset={dataset} rank={rank} exact_match={exact_match:.2f}%")
-    return results
+
+        if is_baseline or rank is None:
+            baseline_results[dataset] = exact_match
+            print(f"Loaded baseline: dataset={dataset} exact_match={exact_match:.2f}%")
+        else:
+            lora_results.setdefault(dataset, {})[rank] = exact_match
+            print(f"Loaded LoRA: dataset={dataset} rank={rank} exact_match={exact_match:.2f}%")
+
+    return lora_results, baseline_results
 
 
-def plot_results(results: dict, save_path: str):
+def plot_dataset(dataset, rank_scores, baseline_score, save_path):
     fig, ax = plt.subplots(figsize=(7, 5))
 
-    markers = ["o", "s", "^", "D", "v", "P"]
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+    ranks = sorted(rank_scores.keys())
+    scores = [rank_scores[r] for r in ranks]
 
-    for i, (dataset, rank_scores) in enumerate(sorted(results.items())):
-        ranks = sorted(rank_scores.keys())
-        scores = [rank_scores[r] for r in ranks]
-        label = dataset.replace("_", " ").title()
-        ax.plot(ranks, scores, marker=markers[i % len(markers)],
-                color=colors[i % len(colors)], label=label, linewidth=2, markersize=8)
-        for r, s in zip(ranks, scores):
-            ax.annotate(f"{s:.1f}", (r, s), textcoords="offset points",
-                        xytext=(0, 8), ha="center", fontsize=8)
+    ax.plot(ranks, scores, marker="o", color="#1f77b4", linewidth=2,
+            markersize=8, label="LoRA fine-tuned")
+    for r, s in zip(ranks, scores):
+        ax.annotate(f"{s:.1f}", (r, s), textcoords="offset points",
+                    xytext=(0, 8), ha="center", fontsize=8)
 
+    if baseline_score is not None:
+        ax.axhline(baseline_score, color="#d62728", linestyle="--", linewidth=1.5,
+                   label=f"Baseline (no LoRA): {baseline_score:.1f}%")
+
+    title = dataset.replace("_", " ").title()
     ax.set_xlabel("LoRA Rank", fontsize=12)
     ax.set_ylabel("Exact Match (%)", fontsize=12)
-    ax.set_title("DiffuGPT LoRA: Exact Match vs Rank", fontsize=13)
+    ax.set_title(f"DiffuGPT LoRA — {title}", fontsize=13)
     ax.set_xscale("log", base=2)
-    ax.set_xticks([1, 2, 4, 8, 16, 32])
+    ax.set_xticks(ranks)
     ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     print(f"Saved plot to {save_path}")
-    plt.show()
+    plt.close(fig)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, default="output/sweep")
-    parser.add_argument("--save_path", type=str, default="sweep_accuracy.png")
+    parser.add_argument("--save_dir", type=str, default=None,
+                        help="Directory to save plots (defaults to output_dir)")
     args = parser.parse_args()
 
-    results = load_results(args.output_dir)
-    if not results:
-        print("No eval_result.json files found. Run eval_sweep_all.sh first.")
+    save_dir = Path(args.save_dir or args.output_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    lora_results, baseline_results = load_results(args.output_dir)
+
+    if not lora_results:
+        print("No LoRA eval_result.json files found. Run eval_sweep_all.sh first.")
     else:
-        plot_results(results, args.save_path)
+        for dataset, rank_scores in sorted(lora_results.items()):
+            baseline = baseline_results.get(dataset)
+            save_path = save_dir / f"sweep_accuracy_{dataset}.png"
+            plot_dataset(dataset, rank_scores, baseline, save_path)

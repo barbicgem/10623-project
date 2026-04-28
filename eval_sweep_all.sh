@@ -7,6 +7,29 @@ OUTPUT_BASE="output/sweep"
 RANKS=(1 2 4 8 16 32)
 MAX_EXAMPLES=500   # set to -1 for full test set (slow)
 
+# ── Baseline (no LoRA) ──────────────────────────────────────────
+for DATASET in arithmetic eleuther_arithmetic; do
+    BASELINE_DIR="${OUTPUT_BASE}/baseline_${DATASET}"
+    mkdir -p ${BASELINE_DIR}
+    if [ -f "${BASELINE_DIR}/eval_result.json" ]; then
+        echo "Skipping baseline ${DATASET} — already done"
+    else
+        echo "========================================"
+        echo "Baseline (no LoRA) | dataset=${DATASET}"
+        echo "========================================"
+        python3 eval_lora.py \
+            --baseline \
+            --dataset           ${DATASET} \
+            --max_examples      ${MAX_EXAMPLES} \
+            --metric_diffusion_steps 64 \
+            --metric_max_new_tokens  64 \
+            --output_json       ${BASELINE_DIR}/eval_result.json
+        echo "Done baseline ${DATASET}"
+        echo ""
+    fi
+done
+
+# ── LoRA ranks ───────────────────────────────────────────────────
 for DATASET in arithmetic eleuther_arithmetic; do
     for RANK in "${RANKS[@]}"; do
         RUN_DIR="${OUTPUT_BASE}/${DATASET}-r${RANK}-lr2e-05-bs16"
@@ -60,6 +83,6 @@ echo "######################################## Plotting"
 
 python3 plot_sweep.py \
     --output_dir ${OUTPUT_BASE} \
-    --save_path  ${OUTPUT_BASE}/sweep_accuracy.png
+    --save_dir   ${OUTPUT_BASE}
 
 echo "Plot saved to ${OUTPUT_BASE}/sweep_accuracy.png"
